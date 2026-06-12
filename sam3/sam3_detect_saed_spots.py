@@ -1,5 +1,4 @@
-
- """
+"""
 SAM 3 SAED Diffraction Spot Detection
 ======================================
 自包含函数：输入 SAED 衍射图像路径，返回检测到的衍射斑点信息。
@@ -84,14 +83,31 @@ def _build_model():
     return _model, _processor, _device
 
 
-def _auto_threshold(scores, skip_top=1):
-    """自动分析分数分布，用肘部法确定阈值（跳过透射斑的最高分）"""
+def _auto_threshold(scores, skip_top=1, elbow_shift=0):
+    """自动分析分数分布，用肘部法确定阈值（跳过透射斑的最高分）
+
+    参数
+    ----
+    scores : np.ndarray
+        所有预测的置信度分数。
+    skip_top : int
+        跳过前 N 个最高分（通常排除透射斑），默认 1。
+    elbow_shift : int
+        肘部位置偏移量，正数向后移 → 保留更多斑点（阈值降低），
+        负数向前移 → 更严格。默认 0。
+
+    返回
+    ----
+    float : 自动确定的阈值。
+    """
     s = np.sort(scores)[::-1]
     s_rest = s[skip_top:]
     if len(s_rest) < 2:
         return 0.0  # 分数太少，不设阈值
     drops = [s_rest[i] - s_rest[i+1] for i in range(min(30, len(s_rest)-1))]
     elbow = np.argmax(drops) + 1
+    # 应用偏移量
+    elbow = int(np.clip(elbow + elbow_shift, 1, len(s_rest) - 1))
     return float(s_rest[elbow])
 
 
@@ -99,6 +115,7 @@ def detect_saed_spots(
     image_path: str,
     prompt: str = "a bright spot",
     skip_top: int = 1,
+    elbow_shift: int = 0,
     return_masks: bool = False,
     verbose: bool = False,
 ) -> dict:
@@ -113,6 +130,9 @@ def detect_saed_spots(
         SAM 3 文本提示词，默认 "a bright spot"。
     skip_top : int
         自动阈值时跳过的最高分数量（用于排除透射斑），默认 1。
+    elbow_shift : int
+        肘部位置偏移量（默认 0）。
+        正数 → 向后移（保留更多斑点），负数 → 向前移（更严格）。
     return_masks : bool
         是否返回掩码数组（默认 False，节省内存）。
     verbose : bool
@@ -165,7 +185,7 @@ def detect_saed_spots(
     boxes_tensor = output["boxes"]
 
     # ---- 自动阈值 ----
-    threshold = _auto_threshold(scores_np, skip_top=skip_top)
+    threshold = _auto_threshold(scores_np, skip_top=skip_top, elbow_shift=elbow_shift)
     keep = scores_np > threshold
 
     masks = masks_tensor[keep]

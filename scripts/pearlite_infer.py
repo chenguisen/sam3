@@ -256,19 +256,79 @@ class PearliteDetector:
             state["geometric_prompt"].append_boxes(b, lbl)
 
         # 推理
+        return self._forward_and_extract(state, orig_w, orig_h, img_resized.size)
+
+    @torch.inference_mode()
+    def detect_by_points(self, image, pos_points=None, neg_points=None, prompt="visual"):
+        """
+        用点提示分割目标。支持正点（前景）和负点（背景）。
+        在 TEM 图像上比文本提示更精确。
+
+        参数:
+            image: PIL.Image
+            pos_points: list of (x, y) 绝对坐标的正点（前景）
+            neg_points: list of (x, y) 绝对坐标的负点（背景）
+            prompt: 文本提示词
+
+        返回: dict 同 detect_by_text
+        """
+        if isinstance(image, np.ndarray):
+            image = Image.fromarray(image)
+        orig_w, orig_h = image.size
+
+        # 收集所有点
+        all_points = []
+        all_labels = []
+        if pos_points:
+            for (px, py) in pos_points:
+                all_points.append([px / orig_w, py / orig_h])
+                all_labels.append(1)  # 正点
+        if neg_points:
+            for (px, py) in neg_points:
+                all_points.append([px / orig_w, py / orig_h])
+                all_labels.append(0)  # 负点
+
+        if not all_points:
+            return {"boxes": [], "scores": [], "masks": [],
+                    "image_size": (orig_w, orig_h), "n_detections": 0}
+
+        img_resized = image.copy()
+        if max(img_resized.size) > 1008:
+            img_resized.thumbnail((1008, 1008), Image.LANCZOS)
+
+        state = self.processor.set_image(img_resized)
+
+        # 设置文本
+        text_outputs = self.model.backbone.forward_text([prompt], device=self.device)
+        state["backbone_out"].update(text_outputs)
+        state["geometric_prompt"] = self.model._get_dummy_prompt()
+
+        # 添加点 (N, 1, 2) 格式
+        pts = torch.tensor(all_points, device=self.device, dtype=torch.float32).view(-1, 1, 2)
+        lbls = torch.tensor(all_labels, device=self.device, dtype=torch.long).view(-1, 1)
+        state["geometric_prompt"].append_points(pts, lbls)
+
+        # 推理
+        return self._forward_and_extract(state, orig_w, orig_h, img_resized.size)
+
+    def _forward_and_extract(self, state, orig_w, orig_h, resized_size):
+        """执行 grounding 推理并提取结果（共用逻辑）。"""
         state = self.processor._forward_grounding(state)
 
         scores = state["scores"].cpu().numpy()
-        masks = state["masks"].cpu().numpy()
+        # 使用原始概率（sigmoid 后），不要用硬阈值 0.5 的 masks
+        # TEM 图像域迁移导致 SAM3 输出概率偏低，0.5 阈值会丢掉大部分 mask
+        mask_probs = state["masks_logits"].cpu().numpy()  # (N, 1, H_rsz, W_rsz)
         boxes = state["boxes"].cpu().numpy()
 
         keep = scores > self.confidence
         scores = scores[keep].tolist()
-        masks = masks[keep]
+        mask_probs = mask_probs[keep]
+        boxes = boxes[keep]
         boxes = boxes[keep]
 
-        scale_x = orig_w / img_resized.size[0]
-        scale_y = orig_h / img_resized.size[1]
+        scale_x = orig_w / resized_size[0]
+        scale_y = orig_h / resized_size[1]
 
         boxes_orig = []
         masks_orig = []
@@ -278,7 +338,10 @@ class PearliteDetector:
                 float(b[0] * scale_x), float(b[1] * scale_y),
                 float(b[2] * scale_x), float(b[3] * scale_y),
             ])
-            m = masks[i, 0]
+            # 用自适应阈值：若最大概率 < 0.5 则用 0.3，否则用 0.5
+            m_prob = mask_probs[i, 0]  # shape (H_rsz, W_rsz)
+            threshold = 0.3 if m_prob.max() < 0.5 else 0.5
+            m = m_prob > threshold
             if m.shape != (orig_h, orig_w):
                 from skimage.transform import resize
                 m = resize(m.astype(float), (orig_h, orig_w),
@@ -463,15 +526,23 @@ class PearliteViewer:
         self.draw_start = None
         self.draw_rect = None
         self.removing = False
+        self._first_draw = True   # 标记是否首次绘制
+
+        # 点选模式
+        self.point_mode = False          # True=点选, False=框选
+        self.pos_points = []             # 当前图片的正点 [(x,y), ...]
+        self.neg_points = []             # 当前图片的负点 [(x,y), ...]
+        self.pos_scatter = None          # matplotlib 散点图对象
+        self.neg_scatter = None
 
     def run(self):
         """启动交互式查看器。"""
         print(f"\n🔍 提示词: '{self.prompt}'  模式: {'自动候选' if self.auto_mode else '纯文本'}")
         print("🖱️  操作说明:")
-        print("  左键拖动: 画框标注 | 点击框内: 删除")
-        print("  滚轮: 缩放  |  中键拖动: 平移  |  右键拖动: 画框")
-        print("  [z] 重置缩放  [n/p] 翻页  [r] 重推理  [a] 切换模式")
-        print("  [s] 保存  [q] 退出\n")
+        print("  左键拖动: 画框标注 | 中键拖动: 平移 | 滚轮: 缩放")
+        print("  点击框内/点: 删除")
+        print("  'd' 切换 框选⇄点选模式  点选: 左键=正点(前景) 右键=负点(背景)")
+        print("  [z]重置缩放 [←→]翻页 [r]重推理 [a]切换检测模式 [s]保存 [q]退出\n")
 
         self._setup_gui()
         self._load_and_show(self.idx)
@@ -499,6 +570,8 @@ class PearliteViewer:
     def _load_and_show(self, idx):
         """加载指定索引的图片并显示。"""
         self.idx = idx
+        self.pos_points = []
+        self.neg_points = []
         path = self.image_paths[idx]
         img = np.array(Image.open(path).convert("RGB"))
         self.current_img = img
@@ -539,19 +612,16 @@ class PearliteViewer:
 
     def _redraw(self):
         """重新绘制当前图像和标注，保持缩放状态。"""
-        # 保存当前视图范围
-        xlim = self.ax_img.get_xlim()
-        ylim = self.ax_img.get_ylim()
-        was_zoomed = not (xlim[0] == 0 and ylim[0] == 0
-                          and abs(xlim[1] - self.current_img.shape[1]) < 1
-                          and abs(ylim[1] - self.current_img.shape[0]) < 1)
+        # 保存用户之前缩放/平移的视图范围（在 clear 之前读）
+        saved_xlim = self.ax_img.get_xlim()
+        saved_ylim = self.ax_img.get_ylim()
 
         self.ax_img.clear()
         result = self.results[self.idx]
         img = self.current_img
         h, w = img.shape[:2]
 
-        # 显示原图
+        # 显示原图（此时 imshow 会设置默认 extent 和 ylim）
         self.ax_img.imshow(img)
         self.ax_img.set_title(
             f"[{self.idx + 1}/{len(self.image_paths)}] "
@@ -561,45 +631,44 @@ class PearliteViewer:
         )
         self.ax_img.axis("on")
 
-        # 绘制掩码（半透明叠加）
-        if result["masks"] and result["n_detections"] > 0:
-            overlay = np.zeros((h, w, 4), dtype=np.float32)
-            for i, mask in enumerate(result["masks"]):
-                color = COLORS(i % 10)[:3]
-                for c in range(3):
-                    overlay[mask, c] = overlay[mask, c] * 0.7 + color[c] * 0.3
-                overlay[mask, 3] = np.maximum(overlay[mask, 3], 0.4)
-            overlay[:, :, 3] = np.clip(overlay[:, :, 3], 0, 1)
-            self.ax_img.imshow(overlay)
+        # 判断 saved_lims 是否与 imshow 刚设置的默认值一致
+        # imshow(origin='upper') 默认 extent≈(-0.5, w-0.5, h-0.5, -0.5)
+        default_xlim = (-0.5, w - 0.5)
+        default_ylim = (h - 0.5, -0.5)
+        at_default = (
+            abs(saved_xlim[0] - default_xlim[0]) < 1
+            and abs(saved_xlim[1] - default_xlim[1]) < 1
+            and abs(saved_ylim[0] - default_ylim[0]) < 1
+            and abs(saved_ylim[1] - default_ylim[1]) < 1
+        )
 
-        # 绘制边界框
-        self.box_patches.clear()
-        for i, box in enumerate(result["boxes"]):
-            x1, y1, x2, y2 = box
-            color = COLORS(i % 10)
-            rect = Rectangle(
-                (x1, y1), x2 - x1, y2 - y1,
-                fill=False, edgecolor=color, linewidth=2, alpha=0.9,
-            )
-            self.ax_img.add_patch(rect)
-            self.box_patches.append(rect)
-
-            # 显示置信度
-            score = result["scores"][i]
-            self.ax_img.text(
-                x1, y1 - 3, f"{score:.2f}",
-                fontsize=8, color=color, weight="bold",
-                bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.7),
-            )
-
-        # 恢复缩放状态
-        if was_zoomed:
-            self.ax_img.set_xlim(xlim)
-            self.ax_img.set_ylim(ylim)
+        if not self._first_draw and not at_default:
+            # 用户之前缩放/平移过 → 恢复视图
+            self.ax_img.set_xlim(saved_xlim)
+            self.ax_img.set_ylim(saved_ylim)
         else:
-            # imshow 默认 origin='upper'，保持默认即可
+            # 首次显示或已重置 → 使用 imshow 默认范围
             self.ax_img.set_xlim(0, w)
             self.zoom_level = 1.0
+
+        self._first_draw = False
+
+        # 绘制点选标记
+        self.pos_scatter = None
+        self.neg_scatter = None
+        mode_tag = ""
+        if self.point_mode:
+            mode_tag = " 【点选模式】"
+            if self.pos_points:
+                xs, ys = zip(*self.pos_points)
+                self.pos_scatter = self.ax_img.scatter(
+                    xs, ys, s=120, c="lime", marker="o", edgecolors="white",
+                    linewidths=1.5, zorder=5, label="正点(前景)")
+            if self.neg_points:
+                xs, ys = zip(*self.neg_points)
+                self.neg_scatter = self.ax_img.scatter(
+                    xs, ys, s=120, c="red", marker="x", edgecolors="white",
+                    linewidths=1.5, zorder=5, label="负点(背景)")
 
         # 状态栏
         self.ax_status.clear()
@@ -609,8 +678,8 @@ class PearliteViewer:
         status = (
             f"📷 {Path(self.image_paths[self.idx]).name}  "
             f"| 🎯 {n} 个珠光体区域  "
-            f"| 🔤 模式: {mode_str}  "
-            f"| [n/p] 翻页  [a] 切换模式  [r] 重推理  [s] 保存  [q] 退出"
+            f"| 🔤 模式: {mode_str}{mode_tag}  "
+            f"| [←→]翻页 [p]切换点选 [a]切换检测 [r]重推理 [s]保存 [q]退出"
         )
         self.ax_status.text(0.5, 0.5, status, ha="center", va="center",
                             fontsize=10, transform=self.ax_status.transAxes,
@@ -629,7 +698,38 @@ class PearliteViewer:
             self.pan_start = (x, y)
             return
 
-        # 左键/右键：画框 或 删除已有框
+        # 点选模式
+        if self.point_mode:
+            if event.button == 1:
+                # 检查是否点击了已有正点（删除）
+                for i, (px, py) in enumerate(self.pos_points):
+                    if abs(px - x) < 8 and abs(py - y) < 8:
+                        self.pos_points.pop(i)
+                        print(f"  🗑️ 删除正点 ({int(px)}, {int(py)})")
+                        self._run_point_inference()
+                        self._redraw()
+                        return
+                # 添加正点
+                self.pos_points.append((x, y))
+                print(f"  ✅ 正点 ({int(x)}, {int(y)})  — 左键继续加点，右键加负点")
+            elif event.button == 3:
+                # 检查是否点击了已有负点（删除）
+                for i, (px, py) in enumerate(self.neg_points):
+                    if abs(px - x) < 8 and abs(py - y) < 8:
+                        self.neg_points.pop(i)
+                        print(f"  🗑️ 删除负点 ({int(px)}, {int(py)})")
+                        self._run_point_inference()
+                        self._redraw()
+                        return
+                # 添加负点
+                self.neg_points.append((x, y))
+                print(f"  ❌ 负点 ({int(x)}, {int(y)})  — 左键加正点")
+            # 加点后立即推理
+            self._run_point_inference()
+            self._redraw()
+            return
+
+        # 框选模式：左键/右键
         if event.button not in (1, 3):
             return
 
@@ -638,7 +738,6 @@ class PearliteViewer:
         for i in range(len(result["boxes"]) - 1, -1, -1):
             x1, y1, x2, y2 = result["boxes"][i]
             if x1 <= x <= x2 and y1 <= y <= y2:
-                # 删除该检测
                 result["boxes"].pop(i)
                 result["scores"].pop(i)
                 result["masks"].pop(i)
@@ -681,6 +780,22 @@ class PearliteViewer:
         self.draw_rect.set_width(abs(x - x0))
         self.draw_rect.set_height(abs(y - y0))
         self.fig.canvas.draw_idle()
+
+    def _run_point_inference(self):
+        """用当前累计的正/负点运行 SAM3 点提示分割。"""
+        if not self.pos_points and not self.neg_points:
+            return
+
+        img = Image.fromarray(self.current_img)
+        t0 = time.time()
+        result = self.detector.detect_by_points(
+            img, pos_points=self.pos_points, neg_points=self.neg_points,
+            prompt="visual",
+        )
+        self.results[self.idx] = result
+        n_pos = len(self.pos_points)
+        n_neg = len(self.neg_points)
+        print(f"  📌 点提示推理 ({n_pos}正+{n_neg}负) → {result['n_detections']} 个区域 ({time.time()-t0:.1f}s)")
 
     def _on_release(self, event):
         # 结束平移
@@ -781,13 +896,24 @@ class PearliteViewer:
     def _on_key(self, event):
         if event.key == "z" or event.key == "Z":
             self._reset_view()
-        elif event.key == "n":
+        elif event.key == "left":
+            # ← 上一张
+            if self.idx > 0:
+                self._save_current()
+                self._load_and_show(self.idx - 1)
+        elif event.key == "right" or event.key == "n":
+            # → 或 n 下一张
             self._save_current()
             if self.idx < len(self.image_paths) - 1:
                 self._load_and_show(self.idx + 1)
-        elif event.key == "p":
-            if self.idx > 0:
-                self._load_and_show(self.idx - 1)
+        elif event.key == "d":
+            # 切换 框选⇄点选
+            self.point_mode = not self.point_mode
+            mode_name = "点选" if self.point_mode else "框选"
+            print(f"  🔄 切换至 {mode_name} 模式")
+            if self.point_mode:
+                print("     左键=正点(前景) | 右键=负点(背景) | 点击已有点=删除")
+            self._redraw()
         elif event.key == "a":
             # 切换模式
             self.auto_mode = not self.auto_mode
