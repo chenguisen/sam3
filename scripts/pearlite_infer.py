@@ -597,8 +597,8 @@ class PearliteViewer:
             self.ax_img.set_xlim(xlim)
             self.ax_img.set_ylim(ylim)
         else:
+            # imshow 默认 origin='upper'，保持默认即可
             self.ax_img.set_xlim(0, w)
-            self.ax_img.set_ylim(h, 0)  # 图像 Y 轴反向
             self.zoom_level = 1.0
 
         # 状态栏
@@ -774,7 +774,7 @@ class PearliteViewer:
             return
         h, w = self.current_img.shape[:2]
         self.ax_img.set_xlim(0, w)
-        self.ax_img.set_ylim(h, 0)  # Y 轴反向
+        self.ax_img.set_ylim(h, 0)
         self.zoom_level = 1.0
         self.fig.canvas.draw_idle()
 
