@@ -433,7 +433,7 @@ class MainWindow(QMainWindow):
         self.cb_method = QComboBox()
         for m in ['Otsu', 'Otsu strict (x1.10)', 'Otsu very strict (x1.20)',
                    'Yen', 'Triangle', 'Li', 'Isodata', 'Mean', 'Minimum',
-                   'Multi-Otsu', '---', 'Gradient Watershed']:
+                   'Multi-Otsu', 'Gradient Watershed']:
             self.cb_method.addItem(m)
         self.cb_method.currentIndexChanged.connect(self._on_param_changed_noauto)
         tb.addWidget(self.cb_method)
