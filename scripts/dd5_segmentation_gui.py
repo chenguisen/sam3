@@ -19,7 +19,7 @@ from skimage import morphology
 from scipy import ndimage as ndi
 import colorsys
 
-from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QObject, QRectF
+from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QObject, QRect, QRectF
 from PyQt6.QtGui import QPixmap, QImage, QAction, QFont, QPainter, QTransform
 from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
 from PyQt6.QtWidgets import (
@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
     QGridLayout, QLabel, QComboBox, QSlider,
     QPushButton, QFileDialog, QGroupBox, QStatusBar,
     QMessageBox, QSizePolicy, QPlainTextEdit, QDockWidget, QSplitter,
-    QFrame, QDialog, QDialogButtonBox,
+    QFrame, QDialog, QDialogButtonBox, QRubberBand,
 )
 
 import matplotlib
@@ -109,12 +109,23 @@ def segment_threshold(img_gray, method='otsu', sigma=0.8, th_coef=1.0,
             m = ndi.binary_fill_holes(m)
             masks.append(m)
 
+    # Expand/contract each individual mask for finer separation
+    if expand != 0:
+        n_iter = max(1, int(abs(expand) * 20))
+        if expand > 0:
+            masks = [ndi.binary_erosion(m, iterations=n_iter) for m in masks]
+        else:
+            masks = [ndi.binary_dilation(m, iterations=n_iter) for m in masks]
+        # Remove masks that disappeared after erosion
+        masks = [m for m in masks if m.sum() >= min_area]
+
     stats = {
         'method': method,
         'sigma': sigma,
         'th_coef': th_coef,
         'open_iter': open_iter,
         'min_area': min_area,
+        'expand': float(expand),
         'th_used': float(th_used),
         'n_blocks': len(masks),
         'use_watershed': use_watershed,
@@ -171,8 +182,8 @@ def compute_grain_stats(masks, img_shape):
         labeled = label(m)
         props = regionprops(labeled)
         if props:
-            major = props[0].major_axis_length
-            minor = props[0].minor_axis_length
+            major = props[0].axis_major_length
+            minor = props[0].axis_minor_length
         else:
             major = minor = 0.0
 
@@ -472,10 +483,23 @@ class MainWindow(QMainWindow):
 
         tb.addWidget(QLabel('  Method:'))
         self.cb_method = QComboBox()
-        for m in ['Otsu', 'Otsu strict (x1.10)', 'Otsu very strict (x1.20)',
-                   'Yen', 'Triangle', 'Li', 'Isodata', 'Mean', 'Minimum',
-                   'Multi-Otsu', 'Gradient Watershed']:
-            self.cb_method.addItem(m)
+        self._method_items = [
+            ('Otsu', 'Otsu 阈值法，自动计算最佳全局阈值，适合双峰分布图像'),
+            ('Otsu strict (x1.10)', 'Otsu 阈值 × 1.10，更严格，只保留更亮的区域，减少粘连'),
+            ('Otsu very strict (x1.20)', 'Otsu 阈值 × 1.20，非常严格，大幅减少检测区域'),
+            ('Yen', 'Yen 阈值法，基于熵最大化，对较暗图像效果好'),
+            ('Triangle', 'Triangle 阈值法，基于直方图三角测量，适合单峰分布'),
+            ('Li', 'Li 阈值法，基于最小交叉熵迭代求解'),
+            ('Isodata', 'Isodata 聚类阈值法，迭代分割背景和前景'),
+            ('Mean', 'Mean 阈值法，直接使用像素均值作为阈值'),
+            ('Minimum', 'Minimum 阈值法，寻找直方图双峰之间的谷底'),
+            ('Multi-Otsu', '多级 Otsu (classes=2)，将图像分为多类后取第一类阈值'),
+            ('Gradient Watershed', '先 Otsu 二值化，再用分水岭算法分割，适合粘连严重的块'),
+        ]
+        for text, tip in self._method_items:
+            self.cb_method.addItem(text)
+            idx = self.cb_method.count() - 1
+            self.cb_method.setItemData(idx, tip, Qt.ItemDataRole.ToolTipRole)
         self.cb_method.currentIndexChanged.connect(self._on_param_changed_noauto)
         tb.addWidget(self.cb_method)
 
@@ -503,7 +527,12 @@ class MainWindow(QMainWindow):
 
         # Link zoom/pan across views
         for v in [self.v0, self.v1, self.v2]:
-            v.view.wheelEvent = lambda e, vv=v: self._sync_views(vv)
+            v.view.wheelEvent = lambda e, vv=v: self._on_view_wheel(vv, e)
+            v.view.horizontalScrollBar().valueChanged.connect(
+                lambda val, vv=v: self._on_scroll_changed(vv))
+            v.view.verticalScrollBar().valueChanged.connect(
+                lambda val, vv=v: self._on_scroll_changed(vv))
+            self._setup_zoom_to_rect(v)
 
         # === Parameters (bottom) ===
         pg = QGroupBox('Parameters')
@@ -512,31 +541,47 @@ class MainWindow(QMainWindow):
 
         self.p_sigma = ParamSlider('Sigma', 0, 3.0, 0.8, 0.05, '{:.2f}')
         self.p_sigma.slider.valueChanged.connect(self._on_param_changed_noauto)
+        self.p_sigma.setToolTip('高斯模糊 sigma 值。越大图像越模糊，适合去除噪声； '
+                                '太小则阈值分割易受噪点影响。建议 0.5~1.5')
         pgrid.addWidget(QLabel('Gaussian blur'), 0, 0)
         pgrid.addWidget(self.p_sigma, 0, 1)
 
         self.p_th_coef = ParamSlider('TH Coef', 0.5, 1.5, 1.0, 0.01)
         self.p_th_coef.slider.valueChanged.connect(self._on_param_changed_noauto)
+        self.p_th_coef.setToolTip('阈值系数。1.0 = 使用算法计算出的原始阈值；\n'
+                                   '>1.0 = 阈值更高（只保留更亮区域）；\n'
+                                   '<1.0 = 阈值更低（保留更多区域）')
         pgrid.addWidget(QLabel('Threshold coef'), 0, 2)
         pgrid.addWidget(self.p_th_coef, 0, 3)
 
         self.p_expand = ParamSlider('Expand', 0, 0.5, 0.10, 0.01)
         self.p_expand.slider.valueChanged.connect(self._on_param_changed_noauto)
-        pgrid.addWidget(QLabel('Box expand'), 0, 4)
+        self.p_expand.setToolTip('单个块的膨胀/腐蚀：\n'
+                                  '>0 = 腐蚀（块缩小，间距增大，切断粘连）\n'
+                                  '<0 = 膨胀（块扩大，填补内部孔洞）\n'
+                                  '数值越大，效果越强（0.10 ≈ 2次迭代）')
+        pgrid.addWidget(QLabel('Expand/Erode'), 0, 4)
         pgrid.addWidget(self.p_expand, 0, 5)
 
         self.p_open = IntParamSlider('Open Iter', 0, 10, 1)
         self.p_open.slider.valueChanged.connect(self._on_param_changed_noauto)
+        self.p_open.setToolTip('开运算迭代次数。先腐蚀后膨胀，用于切断块之间的细薄连接。\n'
+                                '0 = 不处理；1~3 = 轻度切断；>3 = 强力切断')
         pgrid.addWidget(QLabel('Opening'), 1, 0)
         pgrid.addWidget(self.p_open, 1, 1)
 
         self.p_min_area = IntParamSlider('Min Area', 1, 500, 30)
         self.p_min_area.slider.valueChanged.connect(self._on_param_changed_noauto)
+        self.p_min_area.setToolTip('最小块面积（像素）。小于此值的块会被过滤掉。\n'
+                                    '用于去除噪声小点。建议 20~100')
         pgrid.addWidget(QLabel('Min area'), 1, 2)
         pgrid.addWidget(self.p_min_area, 1, 3)
 
         self.p_dist_sigma = ParamSlider('Dist Sigma', 0.5, 10.0, 3.0, 0.1, '{:.1f}')
         self.p_dist_sigma.slider.valueChanged.connect(self._on_param_changed_noauto)
+        self.p_dist_sigma.setToolTip('仅 Watershed 方法有效。距离变换的高斯平滑 sigma。\n'
+                                      '越大则分水岭标记越少，块越少但更完整；\n'
+                                      '越小则分水岭标记越多，块多但易过分割')
         pgrid.addWidget(QLabel('Dist sigma'), 1, 4)
         pgrid.addWidget(self.p_dist_sigma, 1, 5)
 
@@ -587,6 +632,95 @@ class MainWindow(QMainWindow):
                     'th_coef': self.p_th_coef.value()}
         return {'method': 'otsu', 'use_watershed': False,
                 'th_coef': self.p_th_coef.value()}
+
+    def _sync_views(self, source):
+        tr = source.get_transform()
+        for v in [self.v0, self.v1, self.v2]:
+            if v is not source:
+                v.set_transform(tr)
+
+    def _on_view_wheel(self, source, event):
+        """Zoom the source view with mouse wheel, then sync all views."""
+        factor = 1.15
+        view = source.view
+        old_factor = view.transform().m11()
+        if event.angleDelta().y() > 0:
+            view.scale(factor, factor)
+        else:
+            view.scale(1 / factor, 1 / factor)
+        # Clamp zoom
+        new_factor = view.transform().m11()
+        if new_factor < source._min_zoom or new_factor > source._max_zoom:
+            view.setTransform(view.transform().scale(
+                old_factor / new_factor, old_factor / new_factor))
+        # Sync other views
+        tr = source.get_transform()
+        for v in [self.v0, self.v1, self.v2]:
+            if v is not source:
+                v.set_transform(tr)
+
+    def _on_scroll_changed(self, source):
+        """Sync scrollbar positions across all views (for pan/drag)."""
+        if source._is_syncing:
+            return
+        for v in [self.v0, self.v1, self.v2]:
+            if v is not source:
+                v._is_syncing = True
+                v.view.horizontalScrollBar().setValue(
+                    source.view.horizontalScrollBar().value())
+                v.view.verticalScrollBar().setValue(
+                    source.view.verticalScrollBar().value())
+                v._is_syncing = False
+
+    def _setup_zoom_to_rect(self, image_widget):
+        """Add right-click drag to zoom to rectangle on a view."""
+        view = image_widget.view
+        view._rb = QRubberBand(QRubberBand.Shape.Rectangle, view)
+        view._rb_origin = None
+
+        old_press = view.mousePressEvent
+        old_move = view.mouseMoveEvent
+        old_release = view.mouseReleaseEvent
+
+        def mousePressEvent(e):
+            if e.button() == Qt.MouseButton.RightButton:
+                view._rb_origin = e.pos()
+                view._rb.setGeometry(e.pos().x(), e.pos().y(), 0, 0)
+                view._rb.show()
+                e.accept()
+                return
+            old_press(e)
+
+        def mouseMoveEvent(e):
+            if view._rb_origin is not None:
+                rect = QRect(view._rb_origin, e.pos()).normalized()
+                view._rb.setGeometry(rect)
+                e.accept()
+                return
+            old_move(e)
+
+        def mouseReleaseEvent(e):
+            if e.button() == Qt.MouseButton.RightButton and view._rb_origin is not None:
+                view._rb.hide()
+                geom = view._rb.geometry()
+                view._rb_origin = None
+                if geom.width() > 5 and geom.height() > 5:
+                    tl = view.mapToScene(geom.topLeft())
+                    br = view.mapToScene(geom.bottomRight())
+                    scene_rect = QRectF(tl, br).normalized()
+                    view.fitInView(scene_rect, Qt.AspectRatioMode.KeepAspectRatio)
+                    # Sync other views
+                    tr = image_widget.get_transform()
+                    for v in [self.v0, self.v1, self.v2]:
+                        if v is not image_widget:
+                            v.set_transform(tr)
+                e.accept()
+                return
+            old_release(e)
+
+        view.mousePressEvent = mousePressEvent
+        view.mouseMoveEvent = mouseMoveEvent
+        view.mouseReleaseEvent = mouseReleaseEvent
 
     def _start_worker(self):
         if self._img is None:
