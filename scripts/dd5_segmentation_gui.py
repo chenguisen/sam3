@@ -19,15 +19,22 @@ from skimage import morphology
 from scipy import ndimage as ndi
 import colorsys
 
-from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QObject
-from PyQt6.QtGui import QPixmap, QImage, QAction, QFont
+from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QObject, QRectF
+from PyQt6.QtGui import QPixmap, QImage, QAction, QFont, QPainter, QTransform
+from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QComboBox, QSlider,
     QPushButton, QFileDialog, QGroupBox, QStatusBar,
     QMessageBox, QSizePolicy, QPlainTextEdit, QDockWidget, QSplitter,
-    QFrame,
+    QFrame, QDialog, QDialogButtonBox,
 )
+
+import matplotlib
+matplotlib.use('QtAgg')
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
+from matplotlib.figure import Figure
 
 # ====================================================================
 #  Processing logic (runs in worker thread)
@@ -276,53 +283,81 @@ class SegmentationWorker(QThread):
 #  GUI
 # ====================================================================
 
-class ImageWidget(QLabel):
+class ImageWidget(QWidget):
     def __init__(self, title=''):
         super().__init__()
         self.title = title
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setMinimumSize(280, 280)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding,
-                           QSizePolicy.Policy.Expanding)
-        self.setStyleSheet('''
-            QLabel {
-                background-color: #1e1e1e;
-                border: 1px solid #555;
-                border-radius: 4px;
-                color: #888;
-                font-size: 13px;
-            }
-        ''')
-        self.setText(title)
-        self._pixmap = None
+        self._img_np = None
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.title_label = QLabel(title)
+        self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.title_label.setStyleSheet(
+            'QLabel { background:#2d2d2d; color:#aaa; font-size:11px; padding:2px; border:1px solid #555; border-bottom:none; }'
+        )
+        layout.addWidget(self.title_label)
+
+        self._scene = QGraphicsScene(self)
+        self._pixmap_item = QGraphicsPixmapItem()
+        self._scene.addItem(self._pixmap_item)
+        self._pixmap_item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+
+        self.view = QGraphicsView(self._scene)
+        self.view.setStyleSheet(
+            'QGraphicsView { background:#1e1e1e; border:1px solid #555; border-top:none; }'
+        )
+        self.view.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        self.view.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.view.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.view.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.view.setFrameShape(QFrame.Shape.NoFrame)
+        layout.addWidget(self.view, 1)
+
+        self._zoom = 1.0
+        self._min_zoom = 0.05
+        self._max_zoom = 50.0
+        self._is_syncing = False
 
     def set_image(self, img_np):
+        self._img_np = img_np
         if img_np is None:
-            self.setText(self.title)
-            self._pixmap = None
-            self.setPixmap(QPixmap())
+            self._pixmap_item.setPixmap(QPixmap())
+            self.title_label.setText(self.title)
             return
 
         h, w = img_np.shape[:2]
         if img_np.ndim == 2:
             img_np = np.stack([img_np] * 3, axis=-1)
-        if img_np.dtype == np.float32 or img_np.dtype == np.float64:
+        if img_np.dtype in (np.float32, np.float64):
             img_np = (np.clip(img_np, 0, 1) * 255).astype(np.uint8)
-        fmt = QImage.Format.Format_RGBA8888 if img_np.shape[2] == 4 else QImage.Format.Format_RGB888
+        fmt = (QImage.Format.Format_RGBA8888 if img_np.shape[2] == 4
+               else QImage.Format.Format_RGB888)
         qimg = QImage(img_np.data, w, h, img_np.strides[0], fmt)
-        self._pixmap = QPixmap.fromImage(qimg)
-        self._update_pixmap()
+        self._pixmap_item.setPixmap(QPixmap.fromImage(qimg))
+        self._scene.setSceneRect(0, 0, w, h)
+        self._fit_view()
 
-    def _update_pixmap(self):
-        if self._pixmap is not None:
-            scaled = self._pixmap.scaled(
-                self.size(), Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation)
-            self.setPixmap(scaled)
+    def _fit_view(self):
+        self._zoom = 1.0
+        self.view.resetTransform()
+        self.view.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        self._zoom = self.view.transform().m11()
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._update_pixmap()
+    def set_transform(self, tr):
+        if self._is_syncing:
+            return
+        self._is_syncing = True
+        self.view.setTransform(tr)
+        self._zoom = tr.m11()
+        self._is_syncing = False
+
+    def get_transform(self):
+        return self.view.transform()
 
 
 class ParamSlider(QWidget):
@@ -391,6 +426,7 @@ class MainWindow(QMainWindow):
         self._masks = []
         self._grains = []
         self._image_path = None
+        self._last_dir = os.path.expanduser('~')
         self._worker = None
 
         self._setup_ui()
@@ -429,6 +465,11 @@ class MainWindow(QMainWindow):
         self.btn_save.setEnabled(False)
         tb.addWidget(self.btn_save)
 
+        self.btn_plot = QPushButton('📊 Plot')
+        self.btn_plot.clicked.connect(self._show_plot)
+        self.btn_plot.setEnabled(False)
+        tb.addWidget(self.btn_plot)
+
         tb.addWidget(QLabel('  Method:'))
         self.cb_method = QComboBox()
         for m in ['Otsu', 'Otsu strict (x1.10)', 'Otsu very strict (x1.20)',
@@ -450,15 +491,19 @@ class MainWindow(QMainWindow):
         tb.addStretch()
         ml.addLayout(tb)
 
-        # === Image displays ===
+        # === Image displays (linked zoom/pan) ===
         imgs = QHBoxLayout()
-        self.v0 = ImageWidget('Original\n(load an image)')
+        self.v0 = ImageWidget('Original')
         self.v1 = ImageWidget('Binary Mask')
         self.v2 = ImageWidget('Segmentation Result')
         imgs.addWidget(self.v0)
         imgs.addWidget(self.v1)
         imgs.addWidget(self.v2)
         ml.addLayout(imgs, 1)
+
+        # Link zoom/pan across views
+        for v in [self.v0, self.v1, self.v2]:
+            v.view.wheelEvent = lambda e, vv=v: self._sync_views(vv)
 
         # === Parameters (bottom) ===
         pg = QGroupBox('Parameters')
@@ -576,18 +621,29 @@ class MainWindow(QMainWindow):
         self._grains = result['grains']
         self.v1.set_image(result['binary'].astype(np.float32))
         self.v2.set_image(result['label_rgb'])
+        # Sync initial view with original
+        tr = self.v0.get_transform()
+        self.v1.set_transform(tr)
+        self.v2.set_transform(tr)
 
         n = result['n_blocks']
         grains = result['grains']
         if grains:
-            avg_major = float(np.mean([g['major_axis_px'] for g in grains]))
-            avg_minor = float(np.mean([g['minor_axis_px'] for g in grains]))
+            areas = [g['area'] for g in grains]
+            majors = [g['major_axis_px'] for g in grains]
+            minors = [g['minor_axis_px'] for g in grains]
+            avg_major = float(np.mean(majors))
+            avg_minor = float(np.mean(minors))
+            std_area = float(np.std(areas))
+            std_major = float(np.std(majors))
+            std_minor = float(np.std(minors))
         else:
-            avg_major = avg_minor = 0.0
+            avg_major = avg_minor = std_area = std_major = std_minor = 0.0
         self.sb_label.setText(
-            f'Blocks: {n}  Avg: {avg_major:.1f}×{avg_minor:.1f} px  '
-            f'Diam: {result["avg_diam"]:.1f} px  '
+            f'Blocks: {n}  '
+            f'Size: {avg_major:.1f}±{std_major:.1f}×{avg_minor:.1f}±{std_minor:.1f} px  '
             f'Area: {result["total_area"]} px ({result["area_pct"]:.1f}%)  '
+            f'Areaσ: {std_area:.0f} px  '
             f'Image: {self._img.shape[1]}×{self._img.shape[0]}  '
             f'Time: {result["time"]:.3f}s'
         )
@@ -605,7 +661,7 @@ class MainWindow(QMainWindow):
 
     def _open_image(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, 'Open Image', '',
+            self, 'Open Image', self._last_dir,
             'Images (*.png *.jpg *.jpeg *.tif *.tiff *.bmp)')
         if not path:
             return
@@ -617,6 +673,7 @@ class MainWindow(QMainWindow):
             self._img = np.array(img)
             self._img_gray = np.mean(self._img, axis=2)
             self._image_path = path
+            self._last_dir = os.path.dirname(path)
             self._masks = []
             self._grains = []
 
@@ -625,6 +682,7 @@ class MainWindow(QMainWindow):
             self.v2.set_image(None)
             self.btn_run.setEnabled(True)
             self.btn_save.setEnabled(True)
+            self.btn_plot.setEnabled(True)
 
             fn = Path(path).name
             h, w = self._img.shape[:2]
@@ -637,12 +695,20 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, 'Error', f'Failed: {e}')
 
+    def _show_plot(self):
+        if not self._grains:
+            QMessageBox.information(self, "Info", "No data to plot.")
+            return
+        dlg = PlotDialog(self._grains, self)
+        dlg.exec()
+
     def _save_results(self):
         if not self._masks:
             QMessageBox.information(self, 'Info', 'No results.')
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, 'Save Results', 'results.json',
+            self, 'Save Results',
+            os.path.join(self._last_dir, 'results.json'),
             'JSON (*.json);;PNG Image (*.png)')
         if not path:
             return
@@ -664,6 +730,83 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, 'Error', f'Save failed: {e}')
 
+
+
+class PlotDialog(QDialog):
+    """Window showing grain size distribution plots."""
+    def __init__(self, grains, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('Grain Size Distribution')
+        self.setMinimumSize(900, 600)
+        self._grains = grains
+
+        layout = QVBoxLayout(self)
+
+        # Matplotlib figure
+        self.fig = Figure(figsize=(10, 6))
+        self.canvas = FigureCanvas(self.fig)
+        self.toolbar = NavigationToolbar(self.canvas, self)
+
+        layout.addWidget(self.toolbar)
+        layout.addWidget(self.canvas, 1)
+
+        # Sort grains by area descending
+        sorted_grains = sorted(grains, key=lambda g: g['area'], reverse=True)
+        indices = list(range(1, len(sorted_grains) + 1))
+        majors = [g['major_axis_px'] for g in sorted_grains]
+        minors = [g['minor_axis_px'] for g in sorted_grains]
+        diams  = [g['diameter_px'] for g in sorted_grains]
+        areas  = [g['area'] for g in sorted_grains]
+
+        mean_major = float(np.mean(majors))
+        mean_minor = float(np.mean(minors))
+        std_major  = float(np.std(majors))
+        std_minor  = float(np.std(minors))
+
+        ax1 = self.fig.add_subplot(2, 1, 1)
+        ax1.bar(indices, majors, width=0.6, color='steelblue', alpha=0.8, label='Major axis')
+        ax1.bar(indices, minors, width=0.6, color='tomato', alpha=0.8, label='Minor axis')
+        ax1.axhline(mean_major, color='steelblue', linestyle='--', linewidth=1.5,
+                    label=f'Mean major: {mean_major:.1f}\xb1{std_major:.1f} px')
+        ax1.axhline(mean_minor, color='tomato', linestyle='--', linewidth=1.5,
+                    label=f'Mean minor: {mean_minor:.1f}\xb1{std_minor:.1f} px')
+        ax1.fill_between(indices, mean_major - std_major, mean_major + std_major,
+                         color='steelblue', alpha=0.1)
+        ax1.fill_between(indices, mean_minor - std_minor, mean_minor + std_minor,
+                         color='tomato', alpha=0.1)
+        ax1.set_xlabel('Grain index (sorted by area)')
+        ax1.set_ylabel('Length (px)')
+        ax1.set_title(f'Grain Size Distribution  (n={len(grains)})')
+        ax1.legend(fontsize=9)
+        ax1.grid(axis='y', alpha=0.3)
+
+        ax2 = self.fig.add_subplot(2, 1, 2)
+        ax2.bar(indices, diams, width=0.6, color='mediumseagreen', alpha=0.8, label='Diameter')
+        mean_diam = float(np.mean(diams))
+        std_diam = float(np.std(diams))
+        ax2.axhline(mean_diam, color='mediumseagreen', linestyle='--', linewidth=1.5,
+                    label=f'Mean: {mean_diam:.1f}\xb1{std_diam:.1f} px')
+        ax2.fill_between(indices, mean_diam - std_diam, mean_diam + std_diam,
+                         color='mediumseagreen', alpha=0.1)
+        ax2.set_xlabel('Grain index (sorted by area)')
+        ax2.set_ylabel('Eq. Diameter (px)')
+        ax2.legend(fontsize=9)
+        ax2.grid(axis='y', alpha=0.3)
+
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+        # Save button
+        btn_save = QPushButton('Save Plot as PNG')
+        btn_save.clicked.connect(self._save_plot)
+        layout.addWidget(btn_save)
+
+    def _save_plot(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, 'Save Plot', 'grain_size_plot.png',
+            'PNG (*.png)')
+        if path:
+            self.fig.savefig(path, dpi=200, bbox_inches='tight')
 
 def main():
     app = QApplication(sys.argv)
